@@ -8,12 +8,14 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 type MyResult<T> = Result<T, Box<dyn std::error::Error>>;
+
 #[derive(Parser)]
 #[command(author,version,about,long_about=None)]
 struct Cli {
     // [ファイルパス]
     filename: Vec<PathBuf>,
 }
+
 fn main() -> MyResult<()> {
     let cli = Cli::parse();
     let readfiles = cli.filename;
