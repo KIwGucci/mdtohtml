@@ -1,7 +1,9 @@
 mod mycss;
+mod highlight;
+
 use clap::Parser;
 use maud::{html, Markup, PreEscaped, Render, DOCTYPE};
-use pulldown_cmark::{self, html::push_html};
+use pulldown_cmark::{self, html::push_html, Event, Tag, TagEnd, CodeBlockKind};
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -10,123 +12,145 @@ use std::path::{Path, PathBuf};
 type MyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
-#[command(author,version,about,long_about=None)]
+#[command(author, version, about, long_about = None)]
 struct Cli {
-    // [ファイルパス]
+    /// 変換対象のMarkdownファイルパス
     filename: Vec<PathBuf>,
 }
 
 fn main() -> MyResult<()> {
     let cli = Cli::parse();
-    let readfiles = cli.filename;
-    // プログラムの引数から対象ファイル名を取得
-    markdown_to_html(&readfiles)?;
+    markdown_to_html(&cli.filename)?;
     Ok(())
 }
 
 fn markdown_to_html(targets: &[PathBuf]) -> MyResult<()> {
     for target in targets {
-        // // markdownファイルを読み込み
         if !target.is_file() {
+            eprintln!("スキップ: {} はファイルではありません", target.display());
             continue;
         }
-        let md_extention = match target.extension() {
-            Some(ex) => ex.to_string_lossy().to_string(),
-            None => continue,
-        };
-        match md_extention.as_str() {
-            "md" | "markdown" | "mdown" => {
+        match target.extension().and_then(|e| e.to_str()) {
+            Some("md" | "markdown" | "mdown") => {
                 if let Err(e) = convert_md(target) {
-                    eprintln!("{}", e)
+                    eprintln!("変換エラー [{}]: {}", target.display(), e);
                 }
             }
-            _ => println!(
-                "{}は無効です。md|markdown|mdownのいずれかの拡張子を含むファイルを指定してください",
-                target.to_str().unwrap()
+            _ => eprintln!(
+                "{} は無効です。md / markdown / mdown の拡張子を持つファイルを指定してください",
+                target.display()
             ),
         }
     }
-
     Ok(())
 }
 
-/// Renders a block of Markdown using `pulldown-cmark`.
+// ── Markdown レンダラー ──────────────────────────────────────────────────────
+
 struct Markdown<T: AsRef<str>>(T);
 
 impl<T: AsRef<str>> Render for Markdown<T> {
     fn render(&self) -> Markup {
-        // Generate raw HTML
-        // マークアップの時のオプション機能を設定
-        let mut parseoption = pulldown_cmark::Options::empty();
-        // テーブル機能
-        parseoption.insert(pulldown_cmark::Options::ENABLE_TABLES);
-        // ハイフンや...を連続文字を適切な形に変形してくれる
-        parseoption.insert(pulldown_cmark::Options::ENABLE_SMART_PUNCTUATION);
-        // 取り消し線
-        parseoption.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
-        // タスクリスト
-        parseoption.insert(pulldown_cmark::Options::ENABLE_TASKLISTS);
-        // Tex
-        parseoption.insert(pulldown_cmark::Options::ENABLE_MATH);
-        // GitHub Flaverd Markdown
-        parseoption.insert(pulldown_cmark::Options::ENABLE_GFM);
+        let mut opts = pulldown_cmark::Options::empty();
+        opts.insert(pulldown_cmark::Options::ENABLE_TABLES);
+        opts.insert(pulldown_cmark::Options::ENABLE_SMART_PUNCTUATION);
+        opts.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+        opts.insert(pulldown_cmark::Options::ENABLE_TASKLISTS);
+        opts.insert(pulldown_cmark::Options::ENABLE_MATH);
+        opts.insert(pulldown_cmark::Options::ENABLE_GFM);
 
-        let mut my_html = String::new();
-        let parser = pulldown_cmark::Parser::new_ext(self.0.as_ref(), parseoption);
-        push_html(&mut my_html, parser);
+        // コードブロックをシンタックスハイライト済み HTML に差し替える
+        let raw_events: Vec<Event> = pulldown_cmark::Parser::new_ext(self.0.as_ref(), opts).collect();
+        let events = highlight_code_blocks(raw_events);
 
-        PreEscaped(my_html)
+        let mut html_out = String::new();
+        push_html(&mut html_out, events.into_iter());
+
+        PreEscaped(html_out)
     }
 }
 
-fn convert_md(target: &Path) -> MyResult<()> {
-    // mycssファイルのcssをstringとして取得
-    let mdcss = mycss::gen_mdcss();
-    let targetfile = File::open(target)?;
-    // Readerを作る
-    let mut reader = BufReader::new(targetfile);
-    // Stringバッファを確保
-    let mut markdownstr = String::new();
-    // Stringバッファにファイルの内容を読み込む
-    reader.read_to_string(&mut markdownstr)?;
+/// コードブロックのイベント列を syntect でハイライト済みの HTML に置き換える
+fn highlight_code_blocks(events: Vec<Event>) -> Vec<Event> {
+    let mut out: Vec<Event> = Vec::with_capacity(events.len());
+    let mut i = 0;
 
-    // htmlファイルの名前を生成
-    // カレントディレクトリを取得
-    let mut filename = env::current_dir()?;
-    // 対象マークダウンのファイル名を追加
-    filename.push(target);
-    // html titleにマークダウンの拡張子抜きのファイル名を割り当て
-    let filetitle = filename.file_stem();
+    while i < events.len() {
+        match &events[i] {
+            // コードブロック開始
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let lang = match kind {
+                    CodeBlockKind::Fenced(lang) => lang.as_ref().to_owned(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+                i += 1;
 
-    if let Some(ft) = filetitle {
-        let filetitle = ft.to_string_lossy();
-        //
-        // ヘッダを生成
-        let headtext = html! {
-            header{
-            meta charset="UTF-8";
-            title {(filetitle)};
-            style {(mdcss)};
+                // コードブロック内のテキストを収集
+                let mut code = String::new();
+                while i < events.len() {
+                    match &events[i] {
+                        Event::Text(t) => {
+                            code.push_str(t);
+                            i += 1;
+                        }
+                        Event::End(TagEnd::CodeBlock) => {
+                            i += 1;
+                            break;
+                        }
+                        _ => {
+                            i += 1;
+                        }
+                    }
+                }
+
+                // ハイライト済み HTML を挿入
+                let highlighted = highlight::highlight_code(&code, &lang);
+                out.push(Event::Html(highlighted.into()));
             }
-        };
+            _ => {
+                out.push(events[i].clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
 
-        // markdownをhtmlに変換準備
-        let markuptext = html! {
-            (DOCTYPE)html{
-                (headtext)
+// ── ファイル変換 ─────────────────────────────────────────────────────────────
+
+fn convert_md(target: &Path) -> MyResult<()> {
+    let mdcss = mycss::gen_mdcss();
+
+    let mut markdownstr = String::new();
+    BufReader::new(File::open(target)?).read_to_string(&mut markdownstr)?;
+
+    // 出力先パスを組み立て
+    let mut out_path = env::current_dir()?;
+    out_path.push(target);
+    out_path.set_extension("html");
+
+    let filetitle = out_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".to_owned());
+
+    let markup = html! {
+        (DOCTYPE)
+        html {
+            head {
+                meta charset="UTF-8";
+                title { (filetitle) }
+                style { (mdcss) }
+            }
+            body {
                 (Markdown(&markdownstr).render())
             }
-        };
-        // filenameの拡張子をhtmlに変更
-        filename.set_extension("html");
-        let filename = filename.to_str().unwrap();
-        println!("The following files have been created:\n{}", filename);
-        // writerを準備
-        let mut writebuffer = File::create(filename)?;
-        // マークダウンをhtmlに変換レンダリング
-        let outcontent = markuptext.render().into_string();
-        // 書き込み
-        let _wtlen = writebuffer.write(outcontent.as_bytes())?;
+        }
     };
+
+    let out_path_str = out_path.to_string_lossy();
+    println!("生成しました: {}", out_path_str);
+
+    File::create(out_path.as_path())?.write_all(markup.render().into_string().as_bytes())?;
     Ok(())
 }
